@@ -10,9 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 import Meta from 'gi://Meta';
@@ -71,8 +68,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     _ensureWorkspace(manager, index, display) {
         while (manager.get_n_workspaces() <= index)
             manager.append_new_workspace(false, display.get_current_time());
-
-        return manager.get_workspace_by_index(index);
     }
 
     _moveWindowToWorkspace(win, index) {
@@ -87,6 +82,70 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         return true;
     }
 
+    /*
+     * Build the logical workspace groups for one monitor.
+     *
+     * Normal windows belonging to the same workspace remain together.
+     * Protected windows are split into individual groups, because a
+     * maximized/fullscreen application must not share its workspace with
+     * another application on the same monitor.
+     */
+    _getMonitorGroups(monitor, display, excludeWindow = null) {
+        const manager = display.get_workspace_manager();
+        const groups = [];
+
+        for (let index = 0; index < manager.get_n_workspaces(); index++) {
+            const workspace = manager.get_workspace_by_index(index);
+            const windows = this._getApplicationWindows(
+                workspace, monitor, excludeWindow
+            );
+
+            if (windows.length === 0)
+                continue;
+
+            const normalWindows = windows.filter(win => !this._isProtected(win));
+            const protectedWindows = windows.filter(win => this._isProtected(win));
+
+            if (normalWindows.length > 0)
+                groups.push({index, windows: normalWindows, protected: false});
+
+            for (const win of protectedWindows)
+                groups.push({index, windows: [win], protected: true});
+        }
+
+        return groups;
+    }
+
+    /*
+     * Compact one monitor without treating each normal window as a separate
+     * workspace. Existing workspace groups retain their relative order.
+     * Empty workspaces between groups disappear; only the trailing workspace
+     * may remain empty.
+     */
+    _compactMonitor(monitor, display, excludeWindow = null) {
+        const manager = display.get_workspace_manager();
+        const groups = this._getMonitorGroups(monitor, display, excludeWindow);
+
+        if (groups.length === 0) {
+            this._removeTrailingEmptyWorkspaces(display);
+            return;
+        }
+
+        const lastTarget = groups.length - 1;
+        this._ensureWorkspace(manager, lastTarget, display);
+
+        // Move groups from the end to the beginning. Windows in the same
+        // normal group receive the same target workspace and therefore remain
+        // together. Protected groups contain exactly one application.
+        for (let target = groups.length - 1; target >= 0; target--) {
+            const group = groups[target];
+            for (const win of group.windows)
+                this._moveWindowToWorkspace(win, target);
+        }
+
+        this._removeTrailingEmptyWorkspaces(display);
+    }
+
     _removeTrailingEmptyWorkspaces(display) {
         const manager = display.get_workspace_manager();
 
@@ -97,54 +156,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
             manager.remove_workspace(workspace, display.get_current_time());
         }
-    }
-
-    _compactMonitor(monitor, display) {
-        const manager = display.get_workspace_manager();
-        const normalWindows = [];
-        const protectedWindows = [];
-
-        for (const win of global.display.list_all_windows()) {
-            if (!this._isApplicationWindow(win) || win.get_monitor() !== monitor)
-                continue;
-
-            if (this._isProtected(win))
-                protectedWindows.push(win);
-            else
-                normalWindows.push(win);
-        }
-
-        const byWorkspace = (a, b) =>
-            a.get_workspace().index() - b.get_workspace().index();
-
-        normalWindows.sort(byWorkspace);
-        protectedWindows.sort(byWorkspace);
-
-        const assignments = new Map();
-        let target = 0;
-
-        // Normal application windows occupy the beginning of the sequence.
-        for (const win of normalWindows)
-            assignments.set(win, target++);
-
-        // Protected windows occupy the tail, preserving their relative order.
-        for (const win of protectedWindows)
-            assignments.set(win, target++);
-
-        this._ensureWorkspace(manager, Math.max(0, target - 1), display);
-
-        // Move windows in descending target order when possible. This avoids
-        // unnecessarily disturbing windows that are already at their target.
-        const windows = [...assignments.entries()]
-            .sort((a, b) => b[1] - a[1]);
-
-        for (const [win, index] of windows)
-            this._moveWindowToWorkspace(win, index);
-
-        // Workspaces are global in Mutter. Only physically remove a workspace
-        // when it is empty on every monitor, so one monitor never destroys a
-        // workspace still used by another monitor.
-        this._removeTrailingEmptyWorkspaces(display);
     }
 
     _getLastOccupiedWorkspace(manager, monitor, excludeWindow = null) {
@@ -175,17 +186,20 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
         const display = win.get_display();
         const monitor = win.get_monitor();
+        const workspace = win.get_workspace();
 
-        this._compactMonitor(monitor, display);
-
-        const applications = this._getApplicationWindows(
-            win.get_workspace(), monitor
-        );
-
-        // A maximized/fullscreen application that is alone in its workspace
-        // stays there. This is the fundamental exception to the move rule.
-        if (applications.length <= 1)
+        // This decision must be made before compaction changes workspace
+        // membership. A protected window that was already alone may stay put.
+        const applications = this._getApplicationWindows(workspace, monitor);
+        if (applications.length <= 1) {
+            this._compactMonitor(monitor, display);
             return;
+        }
+
+        // First compact normal workspace groups. The current workspace still
+        // contains another application, so the protected window needs its own
+        // workspace after the existing groups have been normalized.
+        this._compactMonitor(monitor, display, win);
 
         const destination = this._findProtectedDestination(win);
         this._moveWindowToWorkspace(win, destination);
@@ -198,7 +212,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const current = win.get_workspace().index();
 
-        // Restoration has strict priority: previous workspace first.
+        // Strict priority: previous workspace first.
         const previous = current - 1;
         if (previous >= 0 && this._isWorkspaceAvailable(
             manager, previous, monitor, win
@@ -206,8 +220,8 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return previous;
         }
 
-        // Only inspect the following workspace when the previous one is not
-        // available because it contains a protected application.
+        // The following workspace is considered only when the previous one
+        // is blocked by a protected application.
         const next = current + 1;
         if (next < manager.get_n_workspaces() && this._isWorkspaceAvailable(
             manager, next, monitor, win
@@ -224,9 +238,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
         const display = win.get_display();
         const monitor = win.get_monitor();
-
-        // Decide the destination before compacting. The current workspace
-        // position is part of the restoration rule.
         const destination = this._findRestoreWorkspace(win);
 
         if (destination !== -1)
@@ -275,7 +286,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
             const windows = [...this._pendingWindows];
             this._pendingWindows.clear();
-
             windows.forEach(win => this._processTransition(win));
             return false;
         });
@@ -323,9 +333,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         this._pendingWindows.delete(win);
         this._windowStates.delete(win);
 
-        // The window may already be in the process of being destroyed, so do
-        // not inspect its type again. Its monitor is the information needed to
-        // compact the remaining applications.
         const display = win.get_display();
         const monitor = win.get_monitor();
 
