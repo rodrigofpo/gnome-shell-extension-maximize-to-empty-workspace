@@ -17,19 +17,31 @@
  */
 import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 //  _mutterSettings.get_boolean('workspaces-only-on-primary');
 //  _mutterSettings.get_boolean('dynamic-workspaces');
 
 const _handles = [];
 
-const _windowids_maximized = {};
-const _windowids_size_change = {};
+const _windowids_maximized = new Map();
+const _windowids_size_change = new Map();
 
-export default class Extension {
+export default class MaximizeToEmptyWorkspaceExtension extends Extension {
  
-    constructor() {
+    constructor(metadata) {
+        super(metadata);
     }
-    
+
+    // Compatibility shim: Meta.Window.get_maximized() was removed in
+    // GNOME Shell 49 (and stays removed in 50+), replaced by
+    // get_maximize_flags(), which returns the same MetaMaximizeFlags value.
+    // Feature-detect so this keeps working on older AND newer GNOME.
+    _getMaximizeFlags(win) {
+        return typeof win.get_maximize_flags === 'function'
+            ? win.get_maximize_flags()
+            : win.get_maximized();
+    }
+
     // First free workspace on the specified monitor
     getFirstFreeMonitor(manager,mMonitor) {
         const n = manager.get_n_workspaces();
@@ -107,7 +119,7 @@ export default class Extension {
                         wList.forEach( w => {w.change_workspace_by_index(current, false);});
                         }
                     // remember reordered window
-                    _windowids_maximized[win.get_id()] = "reorder";
+                    _windowids_maximized.set(win.get_id(), "reorder");
                     }
                 else if (current>firstfree)
                     {
@@ -117,7 +129,7 @@ export default class Extension {
                     // move the other windows to their old places
                     wList.forEach( w => {w.change_workspace_by_index(current, false);});
                     // remember reordered window
-                    _windowids_maximized[win.get_id()] = "reorder";
+                    _windowids_maximized.set(win.get_id(), "reorder");
                     }
                 }
             else
@@ -139,7 +151,7 @@ export default class Extension {
                     wListcurrent.forEach( w => {w.change_workspace_by_index(current, false);});
                     wListfirstfree.forEach( w => {w.change_workspace_by_index(firstfree, false);});
                     // remember reordered window
-                    _windowids_maximized[win.get_id()] = "reorder";
+                    _windowids_maximized.set(win.get_id(), "reorder");
                     }
                 else if (current>firstfree)
                     {
@@ -149,7 +161,7 @@ export default class Extension {
                     wListcurrent.forEach( w => {w.change_workspace_by_index(current, false);});
                     wListfirstfree.forEach( w => {w.change_workspace_by_index(firstfree, false);});
                     // remember reordered window
-                    _windowids_maximized[win.get_id()] = "reorder";
+                    _windowids_maximized.set(win.get_id(), "reorder");
                     }
                 }
             }
@@ -163,14 +175,14 @@ export default class Extension {
         // Idea: don't move the coresponding window to an other workspace (it may be not fully active yet)
         // Reorder the workspaces and move all other window
         
-        if (!(win.get_id() in _windowids_maximized))
+        if (!_windowids_maximized.has(win.get_id()))
             {
             // no new screen is used in the past: do nothing
             return;
             }
         
         // this is not longer maximized
-        delete _windowids_maximized[win.get_id()];
+        _windowids_maximized.delete(win.get_id());
 
 
         const mMonitor=win.get_monitor();
@@ -218,7 +230,7 @@ export default class Extension {
         //console.log("achim","window_manager_map "+win.get_id());
         if (win.window_type !== Meta.WindowType.NORMAL)
             return;
-        if (win.get_maximized() !== Meta.MaximizeFlags.BOTH)
+        if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
             return;
         if (win.is_always_on_all_workspaces())
             return;
@@ -245,16 +257,16 @@ export default class Extension {
         if (change === Meta.SizeChange.MAXIMIZE)
             {
             //console.log("achim","Meta.SizeChange.MAXIMIZE");
-            if (win.get_maximized() === Meta.MaximizeFlags.BOTH)
+            if (this._getMaximizeFlags(win) === Meta.MaximizeFlags.BOTH)
                 {
                 //console.log("achim","=== Meta.MaximizeFlags.BOTH");
-                _windowids_size_change[win.get_id()]="place";
+                _windowids_size_change.set(win.get_id(), "place");
                 }
             }
         else if (change  === Meta.SizeChange.FULLSCREEN)
             {
             //console.log("achim","Meta.SizeChange.FULLSCREEN");
-                _windowids_size_change[win.get_id()]="place";
+                _windowids_size_change.set(win.get_id(), "place");
             }
         else if (change === Meta.SizeChange.UNMAXIMIZE)
             {
@@ -264,16 +276,16 @@ export default class Extension {
             if (rectmax.equal(rectold))
                 {
                 //console.log("achim","rectmax matches");
-                _windowids_size_change[win.get_id()]="back";
+                _windowids_size_change.set(win.get_id(), "back");
                 }
             }
         else if (change === Meta.SizeChange.UNFULLSCREEN)
             {
             //console.log("achim","change === Meta.SizeChange.UNFULLSCREEN");
-            if (win.get_maximized() !== Meta.MaximizeFlags.BOTH)
+            if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
                 {
                 //console.log("achim","!== Meta.MaximizeFlags.BOTH");
-                _windowids_size_change[win.get_id()]="back";
+                _windowids_size_change.set(win.get_id(), "back");
                 }
             }
     }
@@ -295,7 +307,7 @@ export default class Extension {
         //console.log("achim","window_manager_umminimize");
         if (win.window_type !== Meta.WindowType.NORMAL)
             return;
-        if (win.get_maximized() !== Meta.MaximizeFlags.BOTH)
+        if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
             return;
         if (win.is_always_on_all_workspaces())
             return;
@@ -306,13 +318,13 @@ export default class Extension {
     {
         const win = act.meta_window;
         //console.log("achim","window_manager_size_changed "+win.get_id());
-        if (win.get_id() in _windowids_size_change) {
-            if (_windowids_size_change[win.get_id()]=="place") {                
+        if (_windowids_size_change.has(win.get_id())) {
+            if (_windowids_size_change.get(win.get_id()) === "place") {                
                 this.placeOnWorkspace(win);
-            } else if (_windowids_size_change[win.get_id()]=="back") {                
+            } else if (_windowids_size_change.get(win.get_id()) === "back") {                
                 this.backto(win);
             }
-            delete _windowids_size_change[win.get_id()];
+            _windowids_size_change.delete(win.get_id());
         }
     }
 
@@ -336,7 +348,11 @@ export default class Extension {
     disable() {
         // remove array and disconect
         _handles.splice(0).forEach(h => global.window_manager.disconnect(h));
-        
+
+        // free dynamically stored per-window state
+        _windowids_maximized.clear();
+        _windowids_size_change.clear();
+
         this._mutterSettings = null;
     }
 }
