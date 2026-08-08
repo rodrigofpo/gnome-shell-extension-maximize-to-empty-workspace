@@ -54,22 +54,18 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     _getWorkspaceApplications(manager, index, monitor, excludeWindow = null) {
-        const workspace = manager.get_workspace_by_index(index);
-        return this._getApplicationWindows(workspace, monitor, excludeWindow);
+        if (index < 0 || index >= manager.get_n_workspaces())
+            return [];
+
+        return this._getApplicationWindows(
+            manager.get_workspace_by_index(index), monitor, excludeWindow
+        );
     }
 
     _isWorkspaceAvailable(manager, index, monitor, excludeWindow = null) {
         return this._getWorkspaceApplications(
             manager, index, monitor, excludeWindow
         ).every(win => !this._isProtected(win));
-    }
-
-    _getLastOccupiedWorkspace(manager, monitor, excludeWindow = null) {
-        for (let i = manager.get_n_workspaces() - 1; i >= 0; i--) {
-            if (this._getWorkspaceApplications(manager, i, monitor, excludeWindow).length > 0)
-                return i;
-        }
-        return -1;
     }
 
     _ensureWorkspace(manager, index, display) {
@@ -91,27 +87,74 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         return true;
     }
 
+    _removeTrailingEmptyWorkspaces(display) {
+        const manager = display.get_workspace_manager();
+
+        for (let i = manager.get_n_workspaces() - 1; i > 0; i--) {
+            const workspace = manager.get_workspace_by_index(i);
+            if (workspace.list_windows().length > 0)
+                break;
+
+            manager.remove_workspace(workspace, display.get_current_time());
+        }
+    }
+
     _compactMonitor(monitor, display) {
         const manager = display.get_workspace_manager();
-        let target = 0;
-        const n = manager.get_n_workspaces();
+        const normalWindows = [];
+        const protectedWindows = [];
 
-        for (let source = 0; source < n; source++) {
-            const sourceWindows = this._getWorkspaceApplications(
-                manager, source, monitor
-            );
-
-            if (sourceWindows.length === 0)
+        for (const win of global.display.list_all_windows()) {
+            if (!this._isApplicationWindow(win) || win.get_monitor() !== monitor)
                 continue;
 
-            if (source !== target) {
-                sourceWindows.forEach(win => {
-                    win.change_workspace_by_index(target, false);
-                });
-            }
-
-            target++;
+            if (this._isProtected(win))
+                protectedWindows.push(win);
+            else
+                normalWindows.push(win);
         }
+
+        const byWorkspace = (a, b) =>
+            a.get_workspace().index() - b.get_workspace().index();
+
+        normalWindows.sort(byWorkspace);
+        protectedWindows.sort(byWorkspace);
+
+        const assignments = new Map();
+        let target = 0;
+
+        // Normal application windows occupy the beginning of the sequence.
+        for (const win of normalWindows)
+            assignments.set(win, target++);
+
+        // Protected windows occupy the tail, preserving their relative order.
+        for (const win of protectedWindows)
+            assignments.set(win, target++);
+
+        this._ensureWorkspace(manager, Math.max(0, target - 1), display);
+
+        // Move windows in descending target order when possible. This avoids
+        // unnecessarily disturbing windows that are already at their target.
+        const windows = [...assignments.entries()]
+            .sort((a, b) => b[1] - a[1]);
+
+        for (const [win, index] of windows)
+            this._moveWindowToWorkspace(win, index);
+
+        // Workspaces are global in Mutter. Only physically remove a workspace
+        // when it is empty on every monitor, so one monitor never destroys a
+        // workspace still used by another monitor.
+        this._removeTrailingEmptyWorkspaces(display);
+    }
+
+    _getLastOccupiedWorkspace(manager, monitor, excludeWindow = null) {
+        for (let i = manager.get_n_workspaces() - 1; i >= 0; i--) {
+            if (this._getWorkspaceApplications(
+                manager, i, monitor, excludeWindow
+            ).length > 0)
+                return i;
+        }
+        return -1;
     }
 
     _findProtectedDestination(win) {
@@ -119,9 +162,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const manager = display.get_workspace_manager();
         const monitor = win.get_monitor();
         const current = win.get_workspace().index();
-        const lastOccupied = this._getLastOccupiedWorkspace(
-            manager, monitor
-        );
+        const lastOccupied = this._getLastOccupiedWorkspace(manager, monitor, win);
         const destination = Math.max(current, lastOccupied) + 1;
 
         this._ensureWorkspace(manager, destination, display);
@@ -137,15 +178,17 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
         this._compactMonitor(monitor, display);
 
-        const workspace = win.get_workspace();
-        const applications = this._getApplicationWindows(workspace, monitor);
+        const applications = this._getApplicationWindows(
+            win.get_workspace(), monitor
+        );
 
+        // A maximized/fullscreen application that is alone in its workspace
+        // stays there. This is the fundamental exception to the move rule.
         if (applications.length <= 1)
             return;
 
         const destination = this._findProtectedDestination(win);
         this._moveWindowToWorkspace(win, destination);
-
         this._compactMonitor(monitor, display);
     }
 
@@ -155,6 +198,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const current = win.get_workspace().index();
 
+        // Restoration has strict priority: previous workspace first.
         const previous = current - 1;
         if (previous >= 0 && this._isWorkspaceAvailable(
             manager, previous, monitor, win
@@ -162,6 +206,8 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return previous;
         }
 
+        // Only inspect the following workspace when the previous one is not
+        // available because it contains a protected application.
         const next = current + 1;
         if (next < manager.get_n_workspaces() && this._isWorkspaceAvailable(
             manager, next, monitor, win
@@ -179,9 +225,10 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const display = win.get_display();
         const monitor = win.get_monitor();
 
-        this._compactMonitor(monitor, display);
-
+        // Decide the destination before compacting. The current workspace
+        // position is part of the restoration rule.
         const destination = this._findRestoreWorkspace(win);
+
         if (destination !== -1)
             this._moveWindowToWorkspace(win, destination);
 
@@ -215,13 +262,11 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
 
         this._pendingWindows.add(win);
+        this._scheduleEvaluation();
+    }
 
-        if (this._operationInProgress) {
-            this._reevaluatePending = true;
-            return;
-        }
-
-        if (this._laterId !== 0)
+    _scheduleEvaluation() {
+        if (this._operationInProgress || this._laterId !== 0)
             return;
 
         const laters = global.compositor.get_laters();
@@ -231,7 +276,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             const windows = [...this._pendingWindows];
             this._pendingWindows.clear();
 
-            windows.forEach(window => this._processTransition(window));
+            windows.forEach(win => this._processTransition(win));
             return false;
         });
     }
@@ -256,28 +301,12 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     _queueAllApplicationWindows() {
-        if (this._operationInProgress) {
-            this._reevaluatePending = true;
-            return;
-        }
-
         global.display.list_all_windows().forEach(win => {
             if (this._isApplicationWindow(win))
                 this._pendingWindows.add(win);
         });
 
-        if (this._laterId !== 0)
-            return;
-
-        const laters = global.compositor.get_laters();
-        this._laterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
-            this._laterId = 0;
-
-            const windows = [...this._pendingWindows];
-            this._pendingWindows.clear();
-            windows.forEach(window => this._processTransition(window));
-            return false;
-        });
+        this._scheduleEvaluation();
     }
 
     window_manager_map(act) {
@@ -286,8 +315,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
 
         this._windowStates.set(win, false);
-        if (this._isProtected(win))
-            this._queueEvaluation(win);
+        this._queueEvaluation(win);
     }
 
     window_manager_destroy(act) {
@@ -295,9 +323,9 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         this._pendingWindows.delete(win);
         this._windowStates.delete(win);
 
-        if (!this._isApplicationWindow(win))
-            return;
-
+        // The window may already be in the process of being destroyed, so do
+        // not inspect its type again. Its monitor is the information needed to
+        // compact the remaining applications.
         const display = win.get_display();
         const monitor = win.get_monitor();
 
@@ -307,19 +335,11 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     window_manager_size_change(act) {
-        const win = act.meta_window;
-        if (!this._isApplicationWindow(win))
-            return;
-
-        this._queueEvaluation(win);
+        this._queueEvaluation(act.meta_window);
     }
 
     window_manager_size_changed(act) {
-        const win = act.meta_window;
-        if (!this._isApplicationWindow(win))
-            return;
-
-        this._queueEvaluation(win);
+        this._queueEvaluation(act.meta_window);
     }
 
     enable() {
