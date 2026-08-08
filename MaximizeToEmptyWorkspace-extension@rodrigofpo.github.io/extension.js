@@ -83,15 +83,21 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     /*
-     * Build logical workspace groups for one monitor.
+     * Build the logical layout for one monitor.
      *
-     * A group keeps the actual Meta.Workspace object rather than its numeric
-     * index. Normal applications sharing one workspace stay together.
-     * Protected applications are split into individual groups.
+     * Normal applications are grouped by their current workspace and are
+     * placed first. Protected applications (maximized or fullscreen) are then
+     * represented as individual groups. Consequently, the logical invariant
+     * is explicit: normal applications occupy the compacted prefix, while
+     * every protected application gets its own workspace after that prefix.
+     *
+     * The same physical Meta.Workspace may contain applications belonging to
+     * another monitor; those applications are intentionally ignored here.
      */
-    _getMonitorGroups(monitor, display, excludeWindow = null) {
+    _buildLogicalGroups(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
-        const groups = [];
+        const normalGroups = [];
+        const protectedGroups = [];
 
         for (let index = 0; index < manager.get_n_workspaces(); index++) {
             const workspace = manager.get_workspace_by_index(index);
@@ -106,7 +112,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             const protectedWindows = windows.filter(win => this._isProtected(win));
 
             if (normalWindows.length > 0) {
-                groups.push({
+                normalGroups.push({
                     workspace,
                     windows: normalWindows,
                     protected: false,
@@ -114,7 +120,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             }
 
             for (const win of protectedWindows) {
-                groups.push({
+                protectedGroups.push({
                     workspace,
                     windows: [win],
                     protected: true,
@@ -122,13 +128,9 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             }
         }
 
-        return groups;
+        return [...normalGroups, ...protectedGroups];
     }
 
-    /*
-     * Build a stable plan using workspace objects as both source and target.
-     * Numeric indices are resolved only when a move is actually performed.
-     */
     _buildCompactionPlan(groups, manager) {
         return groups.map((group, targetIndex) => ({
             sourceWorkspace: group.workspace,
@@ -139,18 +141,16 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     /*
-     * Compact one monitor using a two-phase plan.
+     * Rebuild the logical layout for one monitor.
      *
-     * Phase 1 isolates moving groups in dedicated temporary workspaces.
-     * Phase 2 moves them to the planned target workspace objects.
-     *
-     * The plan never treats a numeric workspace index as a persistent
-     * identity. This is important because workspace indices can change when
-     * workspaces are added or removed.
+     * All groups are planned before movement. A two-phase move through
+     * temporary workspaces prevents one target from destroying another
+     * group's source state. Workspace objects are used as identities; their
+     * current numeric indices are resolved only at the actual move.
      */
     _compactMonitor(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
-        const groups = this._getMonitorGroups(monitor, display, excludeWindow);
+        const groups = this._buildLogicalGroups(monitor, display, excludeWindow);
 
         if (groups.length === 0) {
             this._removeTrailingEmptyWorkspaces(display);
@@ -174,16 +174,15 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
                 );
             }
 
-            // Phase 1: move each group to its own stable temporary workspace.
+            // Phase 1: isolate each moving logical group.
             movingGroups.forEach((item, offset) => {
                 const temporaryWorkspace = temporaryWorkspaces[offset];
                 item.windows.forEach(win =>
                     this._moveWindowToWorkspace(win, temporaryWorkspace)
                 );
-                item.temporaryWorkspace = temporaryWorkspace;
             });
 
-            // Phase 2: resolve each target object's current index only now.
+            // Phase 2: move each group to its planned workspace object.
             movingGroups.forEach(item => {
                 item.windows.forEach(win =>
                     this._moveWindowToWorkspace(win, item.targetWorkspace)
@@ -206,45 +205,37 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         }
     }
 
-    /*
-     * Find the workspace immediately after the compacted monitor-local
-     * sequence. This is called only after the other applications have been
-     * compacted, so the destination is reserved from the final state rather
-     * than inferred from the pre-compaction layout.
-     */
     _findProtectedDestination(win) {
         const display = win.get_display();
         const manager = display.get_workspace_manager();
         const monitor = win.get_monitor();
-        const groups = this._getMonitorGroups(monitor, display, win);
+        const groups = this._buildLogicalGroups(monitor, display, win);
         const destinationIndex = groups.length;
 
         this._ensureWorkspace(manager, destinationIndex, display);
         return manager.get_workspace_by_index(destinationIndex);
     }
 
+    /*
+     * Entering the protected state is a layout reconstruction, not a special
+     * case tied to the window's original workspace. Remove the window from
+     * the logical layout, compact all remaining applications, then append the
+     * protected window as its own logical group.
+     */
     _enterProtected(win) {
         if (!this._isApplicationWindow(win) || !this._isProtected(win))
             return;
 
         const display = win.get_display();
         const monitor = win.get_monitor();
-        const workspace = win.get_workspace();
 
-        // If this is the only application on its workspace, it may remain
-        // there. We still compact other monitor-local groups if necessary.
-        const applications = this._getApplicationWindows(workspace, monitor);
-        if (applications.length <= 1) {
-            this._compactMonitor(monitor, display, win);
-            return;
-        }
-
-        // Compact the remaining applications first. Only after this step do
-        // we determine and reserve the protected application's destination.
         this._compactMonitor(monitor, display, win);
 
         const destination = this._findProtectedDestination(win);
         this._moveWindowToWorkspace(win, destination);
+
+        // Rebuild once more so the final state is explicitly normal groups
+        // followed by protected groups, with no logical gaps.
         this._compactMonitor(monitor, display);
     }
 
@@ -360,12 +351,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         this._scheduleEvaluation();
     }
 
-    /*
-     * Normalize the existing desktop before event-driven tracking begins.
-     * This enforces the invariant that, for each monitor, application groups
-     * are compacted from workspace 0 onward and any globally empty workspaces
-     * are kept only at the end of the workspace list.
-     */
     _initializeWorkspaceLayout() {
         const display = global.display;
         const monitors = new Set();
@@ -378,6 +363,81 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         monitors.forEach(monitor =>
             this._compactMonitor(monitor, display)
         );
+    }
+
+    window_manager_map(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        // A newly mapped protected window is a new protected group. Normal
+        // windows are deliberately left where they were opened.
+        if (this._isProtected(win)) {
+            this._windowStates.set(win, false);
+            this._queueEvaluation(win);
+        } else {
+            this._windowStates.set(win, false);
+        }
+    }
+
+    window_manager_destroy(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        const display = win.get_display();
+        const monitor = win.get_monitor();
+        const wasProtected = this._windowStates.get(win) === true;
+
+        this._pendingWindows.delete(win);
+        this._windowStates.delete(win);
+
+        this._runOperation(() => {
+            if (wasProtected)
+                this._compactMonitor(monitor, display, win);
+            else
+                this._removeTrailingEmptyWorkspaces(display);
+        });
+    }
+
+    window_manager_size_change(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._queueEvaluation(win);
+    }
+
+    window_manager_size_changed(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._queueEvaluation(win);
+    }
+
+    window_manager_minimize(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        if (this._windowStates.get(win) !== true)
+            return;
+
+        this._windowStates.set(win, false);
+        this._runOperation(() => this._leaveProtected(win));
+    }
+
+    window_manager_unminimize(act) {
+        const win = act.meta_window;
+        if (!this._isApplicationWindow(win))
+            return;
+
+        if (!this._isProtected(win))
+            return;
+
+        this._windowStates.set(win, false);
+        this._queueEvaluation(win);
     }
 
     enable() {
@@ -394,14 +454,18 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             'destroy', (_, act) => this.window_manager_destroy(act)
         ));
         _handles.push(global.window_manager.connect(
+            'minimize', (_, act) => this.window_manager_minimize(act)
+        ));
+        _handles.push(global.window_manager.connect(
+            'unminimize', (_, act) => this.window_manager_unminimize(act)
+        ));
+        _handles.push(global.window_manager.connect(
             'size-change', (_, act) => this.window_manager_size_change(act)
         ));
         _handles.push(global.window_manager.connect(
             'size-changed', (_, act) => this.window_manager_size_changed(act)
         ));
 
-        // First normalize the existing layout. Only after normalization do
-        // we record the real protected state of each application window.
         this._initializeWorkspaceLayout();
 
         global.display.list_all_windows().forEach(win => {
