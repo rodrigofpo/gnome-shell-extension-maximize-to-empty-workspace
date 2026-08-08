@@ -16,255 +16,353 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 import Meta from 'gi://Meta';
-import Gio from 'gi://Gio';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const _handles = [];
-
-const _windowids_maximized = new Map();
-const _windowids_size_change = new Map();
 
 export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     constructor(metadata) {
         super(metadata);
     }
 
-    // Compatibility shim: Meta.Window.get_maximized() was removed in
-    // GNOME Shell 49, replaced by get_maximize_flags(). Feature-detect
-    // so this keeps working on older and newer GNOME Shell versions.
     _getMaximizeFlags(win) {
         return typeof win.get_maximize_flags === 'function'
             ? win.get_maximize_flags()
             : win.get_maximized();
     }
 
-    // First free workspace on the specified monitor.
-    getFirstFreeMonitor(manager, mMonitor) {
-        const n = manager.get_n_workspaces();
-        for (let i = 0; i < n; i++) {
-            const winCount = manager.get_workspace_by_index(i).list_windows()
-                .filter(w => !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor).length;
-            if (winCount < 1)
+    _isApplicationWindow(win) {
+        return win != null &&
+            win.window_type === Meta.WindowType.NORMAL &&
+            !win.is_always_on_all_workspaces();
+    }
+
+    _isProtected(win) {
+        return this._getMaximizeFlags(win) === Meta.MaximizeFlags.BOTH ||
+            win.is_fullscreen();
+    }
+
+    _getApplicationWindows(workspace, monitor, excludeWindow = null) {
+        if (workspace == null)
+            return [];
+
+        return workspace.list_windows().filter(win =>
+            win !== excludeWindow &&
+            this._isApplicationWindow(win) &&
+            win.get_monitor() === monitor
+        );
+    }
+
+    _getWorkspaceApplications(manager, index, monitor, excludeWindow = null) {
+        const workspace = manager.get_workspace_by_index(index);
+        return this._getApplicationWindows(workspace, monitor, excludeWindow);
+    }
+
+    _isWorkspaceAvailable(manager, index, monitor, excludeWindow = null) {
+        return this._getWorkspaceApplications(
+            manager, index, monitor, excludeWindow
+        ).every(win => !this._isProtected(win));
+    }
+
+    _getLastOccupiedWorkspace(manager, monitor, excludeWindow = null) {
+        for (let i = manager.get_n_workspaces() - 1; i >= 0; i--) {
+            if (this._getWorkspaceApplications(manager, i, monitor, excludeWindow).length > 0)
                 return i;
         }
         return -1;
     }
 
-    // Last occupied workspace on the specified monitor.
-    getLastOccupiedMonitor(manager, nCurrent, mMonitor) {
-        for (let i = nCurrent - 1; i >= 0; i--) {
-            const winCount = manager.get_workspace_by_index(i).list_windows()
-                .filter(w => !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor).length;
-            if (winCount > 0)
-                return i;
-        }
-        const n = manager.get_n_workspaces();
-        for (let i = nCurrent + 1; i < n; i++) {
-            const winCount = manager.get_workspace_by_index(i).list_windows()
-                .filter(w => !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor).length;
-            if (winCount > 0)
-                return i;
-        }
-        return -1;
+    _ensureWorkspace(manager, index, display) {
+        while (manager.get_n_workspaces() <= index)
+            manager.append_new_workspace(false, display.get_current_time());
+
+        return manager.get_workspace_by_index(index);
     }
 
-    placeOnWorkspace(win) {
-        // Do not move the corresponding window itself; it may not be fully
-        // active yet. Reorder the workspaces and move the other windows.
-        const mMonitor = win.get_monitor();
-        const wList = win.get_workspace().list_windows()
-            .filter(w => w !== win && !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor);
+    _moveWindowToWorkspace(win, index) {
+        const manager = win.get_display().get_workspace_manager();
+        if (index < 0 || index >= manager.get_n_workspaces())
+            return false;
 
-        if (wList.length >= 1) {
-            const manager = win.get_display().get_workspace_manager();
-            // Use the window's workspace, not the globally active workspace.
-            // This keeps the extension independent for each monitor.
-            const current = win.get_workspace().index();
+        if (win.get_workspace().index() === index)
+            return false;
 
-            if (this._mutterSettings.get_boolean('workspaces-only-on-primary')) {
-                const mPrimary = win.get_display().get_primary_monitor();
-                // Only the primary monitor has multiple independent workspaces
-                // when this Mutter setting is enabled.
-                if (mMonitor !== mPrimary)
-                    return;
+        win.change_workspace_by_index(index, false);
+        return true;
+    }
 
-                const firstfree = this.getFirstFreeMonitor(manager, mMonitor);
-                if (firstfree === -1)
-                    return;
+    _compactMonitor(monitor, display) {
+        const manager = display.get_workspace_manager();
+        let target = 0;
+        const n = manager.get_n_workspaces();
 
-                if (current < firstfree) {
-                    manager.reorder_workspace(manager.get_workspace_by_index(firstfree), current);
-                    wList.forEach(w => w.change_workspace_by_index(current, false));
-                    _windowids_maximized.set(win.get_id(), 'reorder');
-                } else if (current > firstfree) {
-                    manager.reorder_workspace(manager.get_workspace_by_index(current), firstfree);
-                    manager.reorder_workspace(manager.get_workspace_by_index(firstfree + 1), current);
-                    wList.forEach(w => w.change_workspace_by_index(current, false));
-                    _windowids_maximized.set(win.get_id(), 'reorder');
-                }
-            } else {
-                // All monitors have workspaces. Search for a free workspace
-                // on this monitor only.
-                const firstfree = this.getFirstFreeMonitor(manager, mMonitor);
-                if (firstfree === -1)
-                    return;
+        for (let source = 0; source < n; source++) {
+            const sourceWindows = this._getWorkspaceApplications(
+                manager, source, monitor
+            );
 
-                const wListcurrent = win.get_workspace().list_windows()
-                    .filter(w => w !== win && !w.is_always_on_all_workspaces());
-                const wListfirstfree = manager.get_workspace_by_index(firstfree).list_windows()
-                    .filter(w => w !== win && !w.is_always_on_all_workspaces());
+            if (sourceWindows.length === 0)
+                continue;
 
-                if (current < firstfree) {
-                    manager.reorder_workspace(manager.get_workspace_by_index(firstfree), current);
-                    manager.reorder_workspace(manager.get_workspace_by_index(current + 1), firstfree);
-                    wListcurrent.forEach(w => w.change_workspace_by_index(current, false));
-                    wListfirstfree.forEach(w => w.change_workspace_by_index(firstfree, false));
-                    _windowids_maximized.set(win.get_id(), 'reorder');
-                } else if (current > firstfree) {
-                    manager.reorder_workspace(manager.get_workspace_by_index(current), firstfree);
-                    manager.reorder_workspace(manager.get_workspace_by_index(firstfree + 1), current);
-                    wListcurrent.forEach(w => w.change_workspace_by_index(current, false));
-                    wListfirstfree.forEach(w => w.change_workspace_by_index(firstfree, false));
-                    _windowids_maximized.set(win.get_id(), 'reorder');
-                }
+            if (source !== target) {
+                sourceWindows.forEach(win => {
+                    win.change_workspace_by_index(target, false);
+                });
             }
+
+            target++;
         }
     }
 
-    // Back to the last occupied workspace.
-    backto(win) {
-        if (!_windowids_maximized.has(win.get_id()))
+    _findProtectedDestination(win) {
+        const display = win.get_display();
+        const manager = display.get_workspace_manager();
+        const monitor = win.get_monitor();
+        const current = win.get_workspace().index();
+        const lastOccupied = this._getLastOccupiedWorkspace(
+            manager, monitor
+        );
+        const destination = Math.max(current, lastOccupied) + 1;
+
+        this._ensureWorkspace(manager, destination, display);
+        return destination;
+    }
+
+    _enterProtected(win) {
+        if (!this._isApplicationWindow(win) || !this._isProtected(win))
             return;
 
-        _windowids_maximized.delete(win.get_id());
+        const display = win.get_display();
+        const monitor = win.get_monitor();
 
-        const mMonitor = win.get_monitor();
-        const wList = win.get_workspace().list_windows()
-            .filter(w => w !== win && !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor);
+        this._compactMonitor(monitor, display);
 
-        if (wList.length === 0) {
-            const manager = win.get_display().get_workspace_manager();
-            // Use the window's workspace, not the globally active workspace.
-            const current = win.get_workspace().index();
+        const workspace = win.get_workspace();
+        const applications = this._getApplicationWindows(workspace, monitor);
 
-            if (this._mutterSettings.get_boolean('workspaces-only-on-primary')) {
-                const mPrimary = win.get_display().get_primary_monitor();
-                if (mMonitor !== mPrimary)
-                    return;
+        if (applications.length <= 1)
+            return;
 
-                const lastOccupied = this.getLastOccupiedMonitor(manager, current, mMonitor);
-                if (lastOccupied === -1)
-                    return;
+        const destination = this._findProtectedDestination(win);
+        this._moveWindowToWorkspace(win, destination);
 
-                const wListLastOccupied = manager.get_workspace_by_index(lastOccupied).list_windows()
-                    .filter(w => w !== win && !w.is_always_on_all_workspaces() && w.get_monitor() === mMonitor);
-                manager.reorder_workspace(manager.get_workspace_by_index(current), lastOccupied);
-                wListLastOccupied.forEach(w => w.change_workspace_by_index(lastOccupied, false));
-            } else {
-                const lastOccupied = this.getLastOccupiedMonitor(manager, current, mMonitor);
-                if (lastOccupied === -1)
-                    return;
+        this._compactMonitor(monitor, display);
+    }
 
-                const wListCurrent = win.get_workspace().list_windows()
-                    .filter(w => w !== win && !w.is_always_on_all_workspaces());
-                if (wListCurrent.length > 0)
-                    return;
+    _findRestoreWorkspace(win) {
+        const display = win.get_display();
+        const manager = display.get_workspace_manager();
+        const monitor = win.get_monitor();
+        const current = win.get_workspace().index();
 
-                const wListLastOccupied = manager.get_workspace_by_index(lastOccupied).list_windows()
-                    .filter(w => w !== win && !w.is_always_on_all_workspaces());
-                manager.reorder_workspace(manager.get_workspace_by_index(current), lastOccupied);
-                wListLastOccupied.forEach(w => w.change_workspace_by_index(lastOccupied, false));
-            }
+        const previous = current - 1;
+        if (previous >= 0 && this._isWorkspaceAvailable(
+            manager, previous, monitor, win
+        )) {
+            return previous;
         }
+
+        const next = current + 1;
+        if (next < manager.get_n_workspaces() && this._isWorkspaceAvailable(
+            manager, next, monitor, win
+        )) {
+            return next;
+        }
+
+        return -1;
+    }
+
+    _leaveProtected(win) {
+        if (!this._isApplicationWindow(win) || this._isProtected(win))
+            return;
+
+        const display = win.get_display();
+        const monitor = win.get_monitor();
+
+        this._compactMonitor(monitor, display);
+
+        const destination = this._findRestoreWorkspace(win);
+        if (destination !== -1)
+            this._moveWindowToWorkspace(win, destination);
+
+        this._compactMonitor(monitor, display);
+    }
+
+    _processTransition(win) {
+        if (!this._isApplicationWindow(win))
+            return;
+
+        const currentProtected = this._isProtected(win);
+        const previousProtected = this._windowStates.has(win)
+            ? this._windowStates.get(win)
+            : currentProtected;
+
+        if (previousProtected === currentProtected)
+            return;
+
+        this._windowStates.set(win, currentProtected);
+
+        this._runOperation(() => {
+            if (currentProtected)
+                this._enterProtected(win);
+            else
+                this._leaveProtected(win);
+        });
+    }
+
+    _queueEvaluation(win) {
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._pendingWindows.add(win);
+
+        if (this._operationInProgress) {
+            this._reevaluatePending = true;
+            return;
+        }
+
+        if (this._laterId !== 0)
+            return;
+
+        const laters = global.compositor.get_laters();
+        this._laterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+            this._laterId = 0;
+
+            const windows = [...this._pendingWindows];
+            this._pendingWindows.clear();
+
+            windows.forEach(window => this._processTransition(window));
+            return false;
+        });
+    }
+
+    _runOperation(callback) {
+        if (this._operationInProgress) {
+            this._reevaluatePending = true;
+            return;
+        }
+
+        this._operationInProgress = true;
+        try {
+            callback();
+        } finally {
+            this._operationInProgress = false;
+        }
+
+        if (this._reevaluatePending) {
+            this._reevaluatePending = false;
+            this._queueAllApplicationWindows();
+        }
+    }
+
+    _queueAllApplicationWindows() {
+        if (this._operationInProgress) {
+            this._reevaluatePending = true;
+            return;
+        }
+
+        global.display.list_all_windows().forEach(win => {
+            if (this._isApplicationWindow(win))
+                this._pendingWindows.add(win);
+        });
+
+        if (this._laterId !== 0)
+            return;
+
+        const laters = global.compositor.get_laters();
+        this._laterId = laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+            this._laterId = 0;
+
+            const windows = [...this._pendingWindows];
+            this._pendingWindows.clear();
+            windows.forEach(window => this._processTransition(window));
+            return false;
+        });
     }
 
     window_manager_map(act) {
         const win = act.meta_window;
-        if (win.window_type !== Meta.WindowType.NORMAL)
+        if (!this._isApplicationWindow(win))
             return;
-        if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
-            return;
-        if (win.is_always_on_all_workspaces())
-            return;
-        this.placeOnWorkspace(win);
+
+        this._windowStates.set(win, false);
+        if (this._isProtected(win))
+            this._queueEvaluation(win);
     }
 
     window_manager_destroy(act) {
         const win = act.meta_window;
-        _windowids_size_change.delete(win.get_id());
-        if (win.window_type !== Meta.WindowType.NORMAL)
+        this._pendingWindows.delete(win);
+        this._windowStates.delete(win);
+
+        if (!this._isApplicationWindow(win))
             return;
-        this.backto(win);
+
+        const display = win.get_display();
+        const monitor = win.get_monitor();
+
+        this._runOperation(() => {
+            this._compactMonitor(monitor, display);
+        });
     }
 
-    window_manager_size_change(act, change, rectold) {
+    window_manager_size_change(act) {
         const win = act.meta_window;
-        if (win.window_type !== Meta.WindowType.NORMAL)
-            return;
-        if (win.is_always_on_all_workspaces())
+        if (!this._isApplicationWindow(win))
             return;
 
-        if (change === Meta.SizeChange.MAXIMIZE) {
-            if (this._getMaximizeFlags(win) === Meta.MaximizeFlags.BOTH)
-                _windowids_size_change.set(win.get_id(), 'place');
-        } else if (change === Meta.SizeChange.FULLSCREEN) {
-            _windowids_size_change.set(win.get_id(), 'place');
-        } else if (change === Meta.SizeChange.UNMAXIMIZE) {
-            // Do nothing if it was only partially maximized.
-            const rectmax = win.get_work_area_for_monitor(win.get_monitor());
-            if (rectmax.equal(rectold))
-                _windowids_size_change.set(win.get_id(), 'back');
-        } else if (change === Meta.SizeChange.UNFULLSCREEN) {
-            if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
-                _windowids_size_change.set(win.get_id(), 'back');
-        }
-    }
-
-    window_manager_minimize(act) {
-        const win = act.meta_window;
-        if (win.window_type !== Meta.WindowType.NORMAL)
-            return;
-        if (win.is_always_on_all_workspaces())
-            return;
-        this.backto(win);
-    }
-
-    window_manager_unminimize(act) {
-        const win = act.meta_window;
-        if (win.window_type !== Meta.WindowType.NORMAL)
-            return;
-        if (this._getMaximizeFlags(win) !== Meta.MaximizeFlags.BOTH)
-            return;
-        if (win.is_always_on_all_workspaces())
-            return;
-        this.placeOnWorkspace(win);
+        this._queueEvaluation(win);
     }
 
     window_manager_size_changed(act) {
         const win = act.meta_window;
-        if (_windowids_size_change.has(win.get_id())) {
-            if (_windowids_size_change.get(win.get_id()) === 'place')
-                this.placeOnWorkspace(win);
-            else if (_windowids_size_change.get(win.get_id()) === 'back')
-                this.backto(win);
-            _windowids_size_change.delete(win.get_id());
-        }
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._queueEvaluation(win);
     }
 
     enable() {
-        this._mutterSettings = new Gio.Settings({schema_id: 'org.gnome.mutter'});
-        _handles.push(global.window_manager.connect('minimize', (_, act) => {this.window_manager_minimize(act);}));
-        _handles.push(global.window_manager.connect('unminimize', (_, act) => {this.window_manager_unminimize(act);}));
-        _handles.push(global.window_manager.connect('size-changed', (_, act) => {this.window_manager_size_changed(act);}));
-        _handles.push(global.window_manager.connect('map', (_, act) => {this.window_manager_map(act);}));
-        _handles.push(global.window_manager.connect('destroy', (_, act) => {this.window_manager_destroy(act);}));
-        _handles.push(global.window_manager.connect('size-change', (_, act, change, rectold) => {this.window_manager_size_change(act, change, rectold);}));
+        this._windowStates = new Map();
+        this._pendingWindows = new Set();
+        this._laterId = 0;
+        this._operationInProgress = false;
+        this._reevaluatePending = false;
+
+        _handles.push(global.window_manager.connect(
+            'map', (_, act) => this.window_manager_map(act)
+        ));
+        _handles.push(global.window_manager.connect(
+            'destroy', (_, act) => this.window_manager_destroy(act)
+        ));
+        _handles.push(global.window_manager.connect(
+            'size-change', (_, act) => this.window_manager_size_change(act)
+        ));
+        _handles.push(global.window_manager.connect(
+            'size-changed', (_, act) => this.window_manager_size_changed(act)
+        ));
+
+        global.display.list_all_windows().forEach(win => {
+            if (this._isApplicationWindow(win))
+                this._windowStates.set(win, false);
+        });
+
+        this._queueAllApplicationWindows();
     }
 
     disable() {
-        _handles.splice(0).forEach(h => global.window_manager.disconnect(h));
-        _windowids_maximized.clear();
-        _windowids_size_change.clear();
-        this._mutterSettings = null;
+        _handles.splice(0).forEach(handle =>
+            global.window_manager.disconnect(handle)
+        );
+
+        if (this._laterId !== 0) {
+            global.compositor.get_laters().remove(this._laterId);
+            this._laterId = 0;
+        }
+
+        this._pendingWindows.clear();
+        this._windowStates.clear();
+        this._operationInProgress = false;
+        this._reevaluatePending = false;
     }
 }
