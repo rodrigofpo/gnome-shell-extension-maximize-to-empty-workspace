@@ -206,6 +206,12 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         }
     }
 
+    /*
+     * Find the workspace immediately after the compacted monitor-local
+     * sequence. This is called only after the other applications have been
+     * compacted, so the destination is reserved from the final state rather
+     * than inferred from the pre-compaction layout.
+     */
     _findProtectedDestination(win) {
         const display = win.get_display();
         const manager = display.get_workspace_manager();
@@ -225,16 +231,16 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const workspace = win.get_workspace();
 
-        // Decide before compaction changes workspace membership. If this is
-        // the only application on its workspace, it may remain there.
+        // If this is the only application on its workspace, it may remain
+        // there. We still compact other monitor-local groups if necessary.
         const applications = this._getApplicationWindows(workspace, monitor);
         if (applications.length <= 1) {
-            this._compactMonitor(monitor, display);
+            this._compactMonitor(monitor, display, win);
             return;
         }
 
-        // Compact the remaining applications first, then append this
-        // protected application as its own monitor-local group.
+        // Compact the remaining applications first. Only after this step do
+        // we determine and reserve the protected application's destination.
         this._compactMonitor(monitor, display, win);
 
         const destination = this._findProtectedDestination(win);
@@ -354,34 +360,24 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         this._scheduleEvaluation();
     }
 
-    window_manager_map(act) {
-        const win = act.meta_window;
-        if (!this._isApplicationWindow(win))
-            return;
+    /*
+     * Normalize the existing desktop before event-driven tracking begins.
+     * This enforces the invariant that, for each monitor, application groups
+     * are compacted from workspace 0 onward and any globally empty workspaces
+     * are kept only at the end of the workspace list.
+     */
+    _initializeWorkspaceLayout() {
+        const display = global.display;
+        const monitors = new Set();
 
-        this._windowStates.set(win, false);
-        this._queueEvaluation(win);
-    }
-
-    window_manager_destroy(act) {
-        const win = act.meta_window;
-        this._pendingWindows.delete(win);
-        this._windowStates.delete(win);
-
-        const display = win.get_display();
-        const monitor = win.get_monitor();
-
-        this._runOperation(() => {
-            this._compactMonitor(monitor, display);
+        display.list_all_windows().forEach(win => {
+            if (this._isApplicationWindow(win))
+                monitors.add(win.get_monitor());
         });
-    }
 
-    window_manager_size_change(act) {
-        this._queueEvaluation(act.meta_window);
-    }
-
-    window_manager_size_changed(act) {
-        this._queueEvaluation(act.meta_window);
+        monitors.forEach(monitor =>
+            this._compactMonitor(monitor, display)
+        );
     }
 
     enable() {
@@ -404,12 +400,14 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             'size-changed', (_, act) => this.window_manager_size_changed(act)
         ));
 
+        // First normalize the existing layout. Only after normalization do
+        // we record the real protected state of each application window.
+        this._initializeWorkspaceLayout();
+
         global.display.list_all_windows().forEach(win => {
             if (this._isApplicationWindow(win))
-                this._windowStates.set(win, false);
+                this._windowStates.set(win, this._isProtected(win));
         });
-
-        this._queueAllApplicationWindows();
     }
 
     disable() {
