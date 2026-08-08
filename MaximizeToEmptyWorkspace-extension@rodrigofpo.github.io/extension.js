@@ -70,25 +70,24 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             manager.append_new_workspace(false, display.get_current_time());
     }
 
-    _moveWindowToWorkspace(win, index) {
-        const manager = win.get_display().get_workspace_manager();
-        if (index < 0 || index >= manager.get_n_workspaces())
+    _moveWindowToWorkspace(win, workspace) {
+        if (workspace == null)
             return false;
 
-        if (win.get_workspace().index() === index)
+        const currentWorkspace = win.get_workspace();
+        if (currentWorkspace === workspace)
             return false;
 
-        win.change_workspace_by_index(index, false);
+        win.change_workspace_by_index(workspace.index(), false);
         return true;
     }
 
     /*
-     * Build the logical workspace groups for one monitor.
+     * Build logical workspace groups for one monitor.
      *
-     * Normal windows belonging to the same workspace remain together.
-     * Protected windows are split into individual groups, because a
-     * maximized/fullscreen application must not share its workspace with
-     * another application on the same monitor.
+     * A group keeps the actual Meta.Workspace object rather than its numeric
+     * index. Normal applications sharing one workspace stay together.
+     * Protected applications are split into individual groups.
      */
     _getMonitorGroups(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
@@ -106,25 +105,34 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             const normalWindows = windows.filter(win => !this._isProtected(win));
             const protectedWindows = windows.filter(win => this._isProtected(win));
 
-            if (normalWindows.length > 0)
-                groups.push({index, windows: normalWindows, protected: false});
+            if (normalWindows.length > 0) {
+                groups.push({
+                    workspace,
+                    windows: normalWindows,
+                    protected: false,
+                });
+            }
 
-            for (const win of protectedWindows)
-                groups.push({index, windows: [win], protected: true});
+            for (const win of protectedWindows) {
+                groups.push({
+                    workspace,
+                    windows: [win],
+                    protected: true,
+                });
+            }
         }
 
         return groups;
     }
 
     /*
-     * Plan the target workspace for every group before moving anything.
-     * This prevents a move from changing the source of a later group while
-     * the plan is being executed.
+     * Build a stable plan using workspace objects as both source and target.
+     * Numeric indices are resolved only when a move is actually performed.
      */
-    _buildCompactionPlan(groups) {
-        return groups.map((group, target) => ({
-            source: group.index,
-            target,
+    _buildCompactionPlan(groups, manager) {
+        return groups.map((group, targetIndex) => ({
+            sourceWorkspace: group.workspace,
+            targetWorkspace: manager.get_workspace_by_index(targetIndex),
             windows: [...group.windows],
             protected: group.protected,
         }));
@@ -133,13 +141,12 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     /*
      * Compact one monitor using a two-phase plan.
      *
-     * Phase 1 moves every group that needs to move to temporary workspaces.
-     * Phase 2 moves those groups from the temporary workspaces to their final
-     * targets. This avoids collisions between source and target workspaces
-     * and keeps all normal windows from the same group together.
+     * Phase 1 isolates moving groups in dedicated temporary workspaces.
+     * Phase 2 moves them to the planned target workspace objects.
      *
-     * Workspace indices are global in Mutter, so the plan is monitor-local:
-     * other monitors may continue to use the same physical workspace index.
+     * The plan never treats a numeric workspace index as a persistent
+     * identity. This is important because workspace indices can change when
+     * workspaces are added or removed.
      */
     _compactMonitor(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
@@ -150,30 +157,36 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
         }
 
-        const plan = this._buildCompactionPlan(groups);
+        const plan = this._buildCompactionPlan(groups, manager);
         const movingGroups = plan.filter(item =>
-            item.windows.some(win => win.get_workspace().index() !== item.target)
+            item.windows.some(win => win.get_workspace() !== item.targetWorkspace)
         );
 
         if (movingGroups.length > 0) {
-            const firstTemporary = manager.get_n_workspaces();
+            const firstTemporaryIndex = manager.get_n_workspaces();
             for (let i = 0; i < movingGroups.length; i++)
-                this._ensureWorkspace(manager, firstTemporary + i, display);
+                this._ensureWorkspace(manager, firstTemporaryIndex + i, display);
 
-            // Phase 1: isolate every moving group. No group can collide with
-            // another group's source or final target after this phase.
-            movingGroups.forEach((item, offset) => {
-                const temporary = firstTemporary + offset;
-                item.windows.forEach(win =>
-                    this._moveWindowToWorkspace(win, temporary)
+            const temporaryWorkspaces = [];
+            for (let i = 0; i < movingGroups.length; i++) {
+                temporaryWorkspaces.push(
+                    manager.get_workspace_by_index(firstTemporaryIndex + i)
                 );
-                item.temporary = temporary;
+            }
+
+            // Phase 1: move each group to its own stable temporary workspace.
+            movingGroups.forEach((item, offset) => {
+                const temporaryWorkspace = temporaryWorkspaces[offset];
+                item.windows.forEach(win =>
+                    this._moveWindowToWorkspace(win, temporaryWorkspace)
+                );
+                item.temporaryWorkspace = temporaryWorkspace;
             });
 
-            // Phase 2: move each isolated group to its planned destination.
+            // Phase 2: resolve each target object's current index only now.
             movingGroups.forEach(item => {
                 item.windows.forEach(win =>
-                    this._moveWindowToWorkspace(win, item.target)
+                    this._moveWindowToWorkspace(win, item.targetWorkspace)
                 );
             });
         }
@@ -193,25 +206,15 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         }
     }
 
-    _getLastOccupiedWorkspace(manager, monitor, excludeWindow = null) {
-        for (let i = manager.get_n_workspaces() - 1; i >= 0; i--) {
-            if (this._getWorkspaceApplications(
-                manager, i, monitor, excludeWindow
-            ).length > 0)
-                return i;
-        }
-        return -1;
-    }
-
     _findProtectedDestination(win) {
         const display = win.get_display();
         const manager = display.get_workspace_manager();
         const monitor = win.get_monitor();
         const groups = this._getMonitorGroups(monitor, display, win);
-        const destination = groups.length;
+        const destinationIndex = groups.length;
 
-        this._ensureWorkspace(manager, destination, display);
-        return destination;
+        this._ensureWorkspace(manager, destinationIndex, display);
+        return manager.get_workspace_by_index(destinationIndex);
     }
 
     _enterProtected(win) {
@@ -222,16 +225,16 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const workspace = win.get_workspace();
 
-        // This decision must be made before compaction changes workspace
-        // membership. A protected window that was already alone may stay put.
+        // Decide before compaction changes workspace membership. If this is
+        // the only application on its workspace, it may remain there.
         const applications = this._getApplicationWindows(workspace, monitor);
         if (applications.length <= 1) {
             this._compactMonitor(monitor, display);
             return;
         }
 
-        // Normalize the monitor without the protected window, then append
-        // the protected window as its own monitor-local workspace group.
+        // Compact the remaining applications first, then append this
+        // protected application as its own monitor-local group.
         this._compactMonitor(monitor, display, win);
 
         const destination = this._findProtectedDestination(win);
@@ -250,19 +253,18 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         if (previous >= 0 && this._isWorkspaceAvailable(
             manager, previous, monitor, win
         )) {
-            return previous;
+            return manager.get_workspace_by_index(previous);
         }
 
-        // The following workspace is considered only when the previous one
-        // is blocked by a protected application.
+        // Only inspect the following workspace if the previous is blocked.
         const next = current + 1;
         if (next < manager.get_n_workspaces() && this._isWorkspaceAvailable(
             manager, next, monitor, win
         )) {
-            return next;
+            return manager.get_workspace_by_index(next);
         }
 
-        return -1;
+        return null;
     }
 
     _leaveProtected(win) {
@@ -273,7 +275,7 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const destination = this._findRestoreWorkspace(win);
 
-        if (destination !== -1)
+        if (destination != null)
             this._moveWindowToWorkspace(win, destination);
 
         this._compactMonitor(monitor, display);
