@@ -117,10 +117,29 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     /*
-     * Compact one monitor without treating each normal window as a separate
-     * workspace. Existing workspace groups retain their relative order.
-     * Empty workspaces between groups disappear; only the trailing workspace
-     * may remain empty.
+     * Plan the target workspace for every group before moving anything.
+     * This prevents a move from changing the source of a later group while
+     * the plan is being executed.
+     */
+    _buildCompactionPlan(groups) {
+        return groups.map((group, target) => ({
+            source: group.index,
+            target,
+            windows: [...group.windows],
+            protected: group.protected,
+        }));
+    }
+
+    /*
+     * Compact one monitor using a two-phase plan.
+     *
+     * Phase 1 moves every group that needs to move to temporary workspaces.
+     * Phase 2 moves those groups from the temporary workspaces to their final
+     * targets. This avoids collisions between source and target workspaces
+     * and keeps all normal windows from the same group together.
+     *
+     * Workspace indices are global in Mutter, so the plan is monitor-local:
+     * other monitors may continue to use the same physical workspace index.
      */
     _compactMonitor(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
@@ -131,16 +150,32 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
         }
 
-        const lastTarget = groups.length - 1;
-        this._ensureWorkspace(manager, lastTarget, display);
+        const plan = this._buildCompactionPlan(groups);
+        const movingGroups = plan.filter(item =>
+            item.windows.some(win => win.get_workspace().index() !== item.target)
+        );
 
-        // Move groups from the end to the beginning. Windows in the same
-        // normal group receive the same target workspace and therefore remain
-        // together. Protected groups contain exactly one application.
-        for (let target = groups.length - 1; target >= 0; target--) {
-            const group = groups[target];
-            for (const win of group.windows)
-                this._moveWindowToWorkspace(win, target);
+        if (movingGroups.length > 0) {
+            const firstTemporary = manager.get_n_workspaces();
+            for (let i = 0; i < movingGroups.length; i++)
+                this._ensureWorkspace(manager, firstTemporary + i, display);
+
+            // Phase 1: isolate every moving group. No group can collide with
+            // another group's source or final target after this phase.
+            movingGroups.forEach((item, offset) => {
+                const temporary = firstTemporary + offset;
+                item.windows.forEach(win =>
+                    this._moveWindowToWorkspace(win, temporary)
+                );
+                item.temporary = temporary;
+            });
+
+            // Phase 2: move each isolated group to its planned destination.
+            movingGroups.forEach(item => {
+                item.windows.forEach(win =>
+                    this._moveWindowToWorkspace(win, item.target)
+                );
+            });
         }
 
         this._removeTrailingEmptyWorkspaces(display);
@@ -172,9 +207,8 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const display = win.get_display();
         const manager = display.get_workspace_manager();
         const monitor = win.get_monitor();
-        const current = win.get_workspace().index();
-        const lastOccupied = this._getLastOccupiedWorkspace(manager, monitor, win);
-        const destination = Math.max(current, lastOccupied) + 1;
+        const groups = this._getMonitorGroups(monitor, display, win);
+        const destination = groups.length;
 
         this._ensureWorkspace(manager, destination, display);
         return destination;
@@ -196,9 +230,8 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
         }
 
-        // First compact normal workspace groups. The current workspace still
-        // contains another application, so the protected window needs its own
-        // workspace after the existing groups have been normalized.
+        // Normalize the monitor without the protected window, then append
+        // the protected window as its own monitor-local workspace group.
         this._compactMonitor(monitor, display, win);
 
         const destination = this._findProtectedDestination(win);
