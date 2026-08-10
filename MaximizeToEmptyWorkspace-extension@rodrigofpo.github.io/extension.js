@@ -421,11 +421,11 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         if (!this._isApplicationWindow(win))
             return;
 
-        if (this._windowStates.get(win) !== true)
-            return;
-
-        this._windowStates.set(win, false);
-        this._runOperation(() => this._leaveProtected(win));
+        // Minimizing does not change the logical protected state. A maximized
+        // or fullscreen window remains protected while minimized, so it must
+        // keep its workspace reservation and must not be restored or compacted.
+        // Likewise, a normal minimized window requires no layout operation.
+        return;
     }
 
     window_manager_unminimize(act) {
@@ -433,11 +433,10 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         if (!this._isApplicationWindow(win))
             return;
 
-        if (!this._isProtected(win))
-            return;
-
-        this._windowStates.set(win, false);
-        this._queueEvaluation(win);
+        // Unminimizing does not change the logical protected state either.
+        // The regular size-change/evaluation path will handle a real
+        // MAX/FULLSCREEN transition if one occurred while minimized.
+        return;
     }
 
     enable() {
