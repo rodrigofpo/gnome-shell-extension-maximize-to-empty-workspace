@@ -82,18 +82,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         return true;
     }
 
-    /*
-     * Build the logical layout for one monitor.
-     *
-     * Normal applications are grouped by their current workspace and are
-     * placed first. Protected applications (maximized or fullscreen) are then
-     * represented as individual groups. Consequently, the logical invariant
-     * is explicit: normal applications occupy the compacted prefix, while
-     * every protected application gets its own workspace after that prefix.
-     *
-     * The same physical Meta.Workspace may contain applications belonging to
-     * another monitor; those applications are intentionally ignored here.
-     */
     _buildLogicalGroups(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
         const normalGroups = [];
@@ -140,14 +128,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         }));
     }
 
-    /*
-     * Rebuild the logical layout for one monitor.
-     *
-     * All groups are planned before movement. A two-phase move through
-     * temporary workspaces prevents one target from destroying another
-     * group's source state. Workspace objects are used as identities; their
-     * current numeric indices are resolved only at the actual move.
-     */
     _compactMonitor(monitor, display, excludeWindow = null) {
         const manager = display.get_workspace_manager();
         const groups = this._buildLogicalGroups(monitor, display, excludeWindow);
@@ -174,7 +154,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
                 );
             }
 
-            // Phase 1: isolate each moving logical group.
             movingGroups.forEach((item, offset) => {
                 const temporaryWorkspace = temporaryWorkspaces[offset];
                 item.windows.forEach(win =>
@@ -182,7 +161,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
                 );
             });
 
-            // Phase 2: move each group to its planned workspace object.
             movingGroups.forEach(item => {
                 item.windows.forEach(win =>
                     this._moveWindowToWorkspace(win, item.targetWorkspace)
@@ -216,12 +194,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         return manager.get_workspace_by_index(destinationIndex);
     }
 
-    /*
-     * Entering the protected state is a layout reconstruction, not a special
-     * case tied to the window's original workspace. Remove the window from
-     * the logical layout, compact all remaining applications, then append the
-     * protected window as its own logical group.
-     */
     _enterProtected(win) {
         if (!this._isApplicationWindow(win) || !this._isProtected(win))
             return;
@@ -233,9 +205,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
 
         const destination = this._findProtectedDestination(win);
         this._moveWindowToWorkspace(win, destination);
-
-        // Rebuild once more so the final state is explicitly normal groups
-        // followed by protected groups, with no logical gaps.
         this._compactMonitor(monitor, display);
     }
 
@@ -245,7 +214,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         const monitor = win.get_monitor();
         const current = win.get_workspace().index();
 
-        // Strict priority: previous workspace first.
         const previous = current - 1;
         if (previous >= 0 && this._isWorkspaceAvailable(
             manager, previous, monitor, win
@@ -253,7 +221,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return manager.get_workspace_by_index(previous);
         }
 
-        // Only inspect the following workspace if the previous is blocked.
         const next = current + 1;
         if (next < manager.get_n_workspaces() && this._isWorkspaceAvailable(
             manager, next, monitor, win
@@ -365,13 +332,45 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         );
     }
 
+    _rebuildMonitorLayout(monitor, display) {
+        if (monitor == null || display == null)
+            return;
+
+        this._compactMonitor(monitor, display);
+    }
+
+    window_entered_monitor(display, monitor, win) {
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._runOperation(() => {
+            // The window has already entered the new monitor when this signal
+            // is delivered. Rebuild the new monitor using its current monitor
+            // membership, then allow a full pass to settle both sides of the
+            // transition.
+            this._rebuildMonitorLayout(monitor, display);
+            this._queueAllApplicationWindows();
+        });
+    }
+
+    window_left_monitor(display, monitor, win) {
+        if (!this._isApplicationWindow(win))
+            return;
+
+        this._runOperation(() => {
+            // The leaving signal identifies the old monitor. The window may
+            // already report its new monitor, so rebuild the old monitor now
+            // and queue a full pass for the new monitor.
+            this._rebuildMonitorLayout(monitor, display);
+            this._queueAllApplicationWindows();
+        });
+    }
+
     window_manager_map(act) {
         const win = act.meta_window;
         if (!this._isApplicationWindow(win))
             return;
 
-        // A newly mapped protected window is a new protected group. Normal
-        // windows are deliberately left where they were opened.
         if (this._isProtected(win)) {
             this._windowStates.set(win, false);
             this._queueEvaluation(win);
@@ -421,10 +420,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         if (!this._isApplicationWindow(win))
             return;
 
-        // Minimizing does not change the logical protected state. A maximized
-        // or fullscreen window remains protected while minimized, so it must
-        // keep its workspace reservation and must not be restored or compacted.
-        // Likewise, a normal minimized window requires no layout operation.
         return;
     }
 
@@ -433,9 +428,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
         if (!this._isApplicationWindow(win))
             return;
 
-        // Unminimizing does not change the logical protected state either.
-        // The regular size-change/evaluation path will handle a real
-        // MAX/FULLSCREEN transition if one occurred while minimized.
         return;
     }
 
@@ -465,6 +457,15 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             'size-changed', (_, act) => this.window_manager_size_changed(act)
         ));
 
+        _handles.push(global.display.connect(
+            'window-entered-monitor', (_, monitor, win) =>
+                this.window_entered_monitor(global.display, monitor, win)
+        ));
+        _handles.push(global.display.connect(
+            'window-left-monitor', (_, monitor, win) =>
+                this.window_left_monitor(global.display, monitor, win)
+        ));
+
         this._initializeWorkspaceLayout();
 
         global.display.list_all_windows().forEach(win => {
@@ -474,9 +475,19 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     disable() {
-        _handles.splice(0).forEach(handle =>
-            global.window_manager.disconnect(handle)
-        );
+        _handles.splice(0).forEach(handle => {
+            // Handles can originate from either WindowManager or Display.
+            // Both objects expose the same disconnect(handle) operation.
+            try {
+                global.window_manager.disconnect(handle);
+            } catch (e) {
+                try {
+                    global.display.disconnect(handle);
+                } catch (error) {
+                    logError(error, `${this.metadata.uuid}: failed to disconnect signal`);
+                }
+            }
+        });
 
         if (this._laterId !== 0) {
             global.compositor.get_laters().remove(this._laterId);
