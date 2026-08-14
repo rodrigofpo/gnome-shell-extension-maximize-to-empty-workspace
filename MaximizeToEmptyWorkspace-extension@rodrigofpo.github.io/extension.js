@@ -15,8 +15,6 @@
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const _handles = [];
-
 export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     constructor(metadata) {
         super(metadata);
@@ -344,10 +342,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
 
         this._runOperation(() => {
-            // The window has already entered the new monitor when this signal
-            // is delivered. Rebuild the new monitor using its current monitor
-            // membership, then allow a full pass to settle both sides of the
-            // transition.
             this._rebuildMonitorLayout(monitor, display);
             this._queueAllApplicationWindows();
         });
@@ -358,9 +352,6 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
             return;
 
         this._runOperation(() => {
-            // The leaving signal identifies the old monitor. The window may
-            // already report its new monitor, so rebuild the old monitor now
-            // and queue a full pass for the new monitor.
             this._rebuildMonitorLayout(monitor, display);
             this._queueAllApplicationWindows();
         });
@@ -432,36 +423,38 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     enable() {
+        this._windowManagerHandles = [];
+        this._displayHandles = [];
         this._windowStates = new Map();
         this._pendingWindows = new Set();
         this._laterId = 0;
         this._operationInProgress = false;
         this._reevaluatePending = false;
 
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'map', (_, act) => this.window_manager_map(act)
         ));
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'destroy', (_, act) => this.window_manager_destroy(act)
         ));
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'minimize', (_, act) => this.window_manager_minimize(act)
         ));
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'unminimize', (_, act) => this.window_manager_unminimize(act)
         ));
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'size-change', (_, act) => this.window_manager_size_change(act)
         ));
-        _handles.push(global.window_manager.connect(
+        this._windowManagerHandles.push(global.window_manager.connect(
             'size-changed', (_, act) => this.window_manager_size_changed(act)
         ));
 
-        _handles.push(global.display.connect(
+        this._displayHandles.push(global.display.connect(
             'window-entered-monitor', (_, monitor, win) =>
                 this.window_entered_monitor(global.display, monitor, win)
         ));
-        _handles.push(global.display.connect(
+        this._displayHandles.push(global.display.connect(
             'window-left-monitor', (_, monitor, win) =>
                 this.window_left_monitor(global.display, monitor, win)
         ));
@@ -475,27 +468,27 @@ export default class MaximizeToEmptyWorkspaceExtension extends Extension {
     }
 
     disable() {
-        _handles.splice(0).forEach(handle => {
-            // Handles can originate from either WindowManager or Display.
-            // Both objects expose the same disconnect(handle) operation.
-            try {
-                global.window_manager.disconnect(handle);
-            } catch (e) {
-                try {
-                    global.display.disconnect(handle);
-                } catch (error) {
-                    logError(error, `${this.metadata.uuid}: failed to disconnect signal`);
-                }
-            }
-        });
+        if (this._windowManagerHandles) {
+            this._windowManagerHandles.forEach(handle =>
+                global.window_manager.disconnect(handle)
+            );
+            this._windowManagerHandles = null;
+        }
+
+        if (this._displayHandles) {
+            this._displayHandles.forEach(handle =>
+                global.display.disconnect(handle)
+            );
+            this._displayHandles = null;
+        }
 
         if (this._laterId !== 0) {
             global.compositor.get_laters().remove(this._laterId);
             this._laterId = 0;
         }
 
-        this._pendingWindows.clear();
-        this._windowStates.clear();
+        this._pendingWindows?.clear();
+        this._windowStates?.clear();
         this._operationInProgress = false;
         this._reevaluatePending = false;
     }
